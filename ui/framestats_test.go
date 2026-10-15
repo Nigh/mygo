@@ -31,8 +31,19 @@ func TestFrameCapture(t *testing.T) {
 		t.Fatal("missing frames", capture)
 	}
 	for _, f := range capture.Frames {
-		if f.WallNS <= 0 || f.PhasesNS[phasePaint] <= 0 || f.Path != "drawn in memory" {
+		// A fast frame can finish within one tick of Windows' clock.
+		if f.StartNS < 0 || f.WallNS < 0 || f.Path != "drawn in memory" {
 			t.Fatal("invalid frame", f)
+		}
+		var elapsed int64
+		for _, d := range f.PhasesNS {
+			if d < 0 {
+				t.Fatal("negative phase duration", f)
+			}
+			elapsed += d
+		}
+		if elapsed > f.WallNS {
+			t.Fatal("phases exceed frame duration", f)
 		}
 	}
 	// The bounded collector does not grow or overwrite earlier samples.

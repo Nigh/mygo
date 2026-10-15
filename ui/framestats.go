@@ -178,7 +178,10 @@ func (f *frameStats) end(rt *engine) {
 		for i, d := range f.laps {
 			row.PhasesNS[i] = d.Nanoseconds()
 		}
-		if p, ok := rt.host.(interface{ framePath() string }); ok {
+		if h, ok := rt.host.(*windowHost); ok {
+			// Keep per-frame GPU summaries out of bounded capture storage.
+			row.Path = h.path
+		} else if p, ok := rt.host.(interface{ framePath() string }); ok {
 			row.Path = p.framePath()
 		}
 		if len(f.rows) < cap(f.rows) {
