@@ -6,12 +6,12 @@ import (
 )
 
 func TestWaveformRing(t *testing.T) {
-	s := newWaveform(1280, 720, "raw", 0)
+	s := newWaveform("raw")
 	start := time.Unix(1, 0)
 	s.update(start)
 	for _, elapsed := range []time.Duration{time.Millisecond, 17 * time.Millisecond, 16 * time.Second, 40*time.Second + time.Millisecond/2} {
 		s.update(start.Add(elapsed))
-		want := int64(samples) + elapsed.Nanoseconds()/int64(time.Millisecond)
+		want := int64(samples) + elapsed.Milliseconds()
 		if s.next != want {
 			t.Fatal(s.next, want)
 		}

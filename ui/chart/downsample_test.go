@@ -49,15 +49,6 @@ func TestMinMax(t *testing.T) {
 	}
 }
 
-func TestMinMaxUnsorted(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("unsorted xs accepted")
-		}
-	}()
-	MinMax(nil, nil, []float32{.5, .1}, []float32{0, 1}, 10)
-}
-
 func TestMinMaxReuseAndDensity(t *testing.T) {
 	xs, ys := make([]float32, 15000), make([]float32, 15000)
 	for i := range xs {

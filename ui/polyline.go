@@ -6,12 +6,14 @@ import (
 	"github.com/egoist/mygo/internal/scene"
 )
 
-// StrokePolyline draws connected points in DIPs with round joins and caps.
-// Non-finite points break the line; isolated points do not draw. Opaque lines
-// on a native GPU use instanced capsules without rasterizing path masks.
-// Antialiasing at overlapping edges can differ slightly from StrokePath.
-// Translucent lines and CPU rendering use the same outline as StrokePath,
-// avoiding alpha accumulating where segments overlap. Storage is reused.
+// StrokePolyline draws a line through points in DIPs, width DIPs wide,
+// with round joins and caps, as StrokePath draws a path of straight lines:
+// a NaN or infinite point breaks the line there, and a point alone draws
+// nothing. It suits lines that change every frame, as live charts: on a
+// GPU, an opaque line draws each segment as a rounded rectangle instead of
+// rasterizing a mask of the whole line, so that its edges can look a
+// little bolder where segments overlap. Translucent lines draw as
+// StrokePath's, which keeps overlaps from showing darker.
 func (p *Painter) StrokePolyline(points [][2]float32, width float32, c Color) {
 	finite := func(v float32) bool { return !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0) }
 	if width <= 0 || !finite(width) || c.A == 0 {

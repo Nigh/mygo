@@ -138,39 +138,42 @@ area.Draw(func(p *ui.Painter, r ui.Rect) {
 })
 ```
 
-For live linear waveforms, reduce samples to physical pixel columns with
-`chart.MinMax`. It preserves each column's minimum and maximum in their
-original order, plus each run's endpoints, so narrow spikes survive. Inputs are plot
-fractions with nondecreasing X; non-finite values break the line. Keep the
-full samples for selection and readings. Reuse the output slices and a path
-per series to avoid allocations after warming up:
+### Live data
+
+A line of thousands of samples, redrawn every frame as new ones arrive,
+needs fewer points than it has samples: `chart.MinMax` keeps the lowest
+and highest sample of each pixel column, in their order, and the ends of
+each run, so that the line looks the same and narrow spikes still show.
+Its `xs` are fractions that never decrease; a NaN still breaks the line.
+It writes into the slices you pass, and `chart.LineInto` into the path you
+pass, so that a view keeping them draws without allocating once warm.
+Keep the samples themselves for selections and readings.
+
+`Painter.StrokePolyline` strokes points in DIPs with round joins and caps,
+as `StrokePath` would, faster for lines that change every frame: on a GPU
+it draws each segment as a rounded rectangle, rather than rasterizing the
+whole line into a mask on the CPU. Where segments overlap, their
+antialiased edges can look a little bolder than `StrokePath`'s.
+Translucent lines, and drawing without a GPU, take `StrokePath`'s way,
+since overlapping segments would show darker there.
 
 ```go
-// Keep reducedX, reducedY and path in the view's persistent state.
+// bx, by and points live in the view's state, reused every frame.
 area.Draw(func(p *ui.Painter, r ui.Rect) {
-    reducedX, reducedY = chart.MinMax(reducedX, reducedY, xs, ys,
-        int(math.Ceil(float64(r.W*p.Scale()))))
-    p.StrokePath(chart.LineInto(&path, r, reducedX, reducedY, chart.CurveLinear),
-        2, t.Accent)
+	bx, by = chart.MinMax(bx, by, xs, ys, int(math.Ceil(float64(r.W*p.Scale()))))
+	points = points[:0]
+	for i, x := range bx {
+		points = append(points, [2]float32{chart.X(r, x), chart.Y(r, by[i])})
+	}
+	p.StrokePolyline(points, 2, t.Accent)
 })
 ```
 
-`chart.LineInto` replaces the path, retaining its storage and clearing any
-`Trim`. `ui.Path.Reset` also clears a path without discarding its storage.
-Use a fixed-capacity ring for incoming samples and consume them in batches
-on the UI thread. Request continuous frames with `Context.AnimationFrame`,
-independently of the sampling cadence, rather than invalidating per sample.
-See `examples/chart-streaming` for a three-series, 1 kHz rolling waveform.
-
-For opaque live lines, convert the reduced fractions to DIP points and call
-`Painter.StrokePolyline(points, width, color)`. On a GPU it draws instanced
-round-capped segments directly, avoiding CPU path masks; it reuses the
-existing renderer on Metal, Direct3D and GL/WebGL. Reuse the points slice as
-well. CPU rendering and translucent strokes retain the path outline to
-avoid opacity accumulating at joins. Opaque GPU edges can have slightly
-different antialiasing where segments overlap. Existing `StrokePath` keeps
-its rendering behavior. Measurements and commands are in
-[the streaming example](../../examples/chart-streaming/README.md).
+Ask for frames with `Context.AnimationFrame` and take in the samples that
+arrived since the last one, rather than invalidating per sample.
+`examples/chart-streaming` scrolls three waveforms of 15,000 samples,
+1,000 a second each; `-mode path` and `-mode raw` draw them with
+`StrokePath`, to compare.
 
 ## Stacks
 

@@ -380,7 +380,7 @@ func newRuntime(view func(*context), h host) *engine {
 	rt.arena = &elementOwner{rt: rt}
 	rt.public = &Context{rt: rt, services: Services{owner: rt.owner}}
 	rt.handleChecks = developmentHandles
-	if frameStatsOn || frameCapturePath != "" {
+	if frameStatsOn {
 		rt.stats = newFrameStats(frameStatsThreshold)
 	}
 	return rt
