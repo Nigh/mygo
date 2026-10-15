@@ -594,6 +594,14 @@ func (rt *engine) keyDownPhysical(mods Modifiers, key, physical Key, repeat bool
 		rt.blinkStart = time.Now()
 		return true
 	}
+	if s := rt.states[rt.focused]; s != nil && s.editor != nil && s.editor.onTextKey != nil && s.flags&flagEditable != 0 &&
+		!typesText(k) && (s.editor.wants(k) || !rt.claimed(k)) && s.editor.textKey(k) {
+		// OnTextKey took it as it came, as HandleInput does, but after the
+		// keys and text before it, which it reads.
+		rt.blinkStart = time.Now()
+		rt.requestFrame()
+		return true
+	}
 	if (key == KeyContextMenu && mods == 0 || key == KeyF10 && mods == Shift) && !rt.claimed(k) && rt.menuKey() {
 		return false
 	}
@@ -855,7 +863,7 @@ func (rt *engine) updateTextInput() {
 	var t platform.TextInputState
 	base := 0
 	if s := rt.states[rt.focused]; s != nil && s.textClient != nil && rt.windowFocus() && s.flags&flagDisabled == 0 && (s.editor == nil || !s.editor.readOnly) {
-		t.Active, t.Client = true, s.textAdapter
+		t.Active, t.Client, t.NoInputMethod = true, s.textAdapter, s.noIME
 		sel := s.textAdapter.Selection()
 		caret := sel.Caret()
 		if bounds, _, ok := s.textAdapter.BoundsForRange(TextInputRange{Start: caret, End: caret}); ok {
@@ -866,7 +874,7 @@ func (rt *engine) updateTextInput() {
 		}
 	} else if s != nil && s.editor == nil && s.input != nil && s.takesText && rt.windowFocus() {
 		// An element taking text itself: no text around the caret.
-		t.Active = true
+		t.Active, t.NoInputMethod = true, s.noIME
 		r := transformRect(s.world, Rect{s.x + s.caret.X, s.y + s.caret.Y, s.caret.W, s.caret.H})
 		t.Caret = platform.RectF{X: float64(r.X), Y: float64(r.Y), W: float64(r.W), H: float64(r.H)}
 	}
@@ -1243,9 +1251,8 @@ func (d *dragTrack) velocities(now time.Time) [4]float32 {
 	return [4]float32{(newest.x - oldest.x) / dt, (newest.y - oldest.y) / dt, (newest.wx - oldest.wx) / dt, (newest.wy - oldest.wy) / dt}
 }
 
-// Changed applies pending input to the controls built so far and reports
-// whether this widget's value changed in this build pass. Configure controls
-// before querying their response; the bound value is updated before returning.
+// Changed reports whether this widget's value changed in this build pass,
+// by the input it took as its constructor returned.
 func (e *node) Changed() bool {
 	if e.hasState() {
 		e.c.rt.applyInputs()
@@ -1257,9 +1264,8 @@ func (e *node) Changed() bool {
 	return false
 }
 
-// Submitted applies pending input to the controls built so far and reports
-// whether Enter was pressed in a single-line text input. Configure controls
-// before querying their response; the bound value is updated before returning.
+// Submitted reports whether Enter was pressed in a single-line text input
+// in this build pass.
 func (e *node) Submitted() bool {
 	if !e.hasState() {
 		return false

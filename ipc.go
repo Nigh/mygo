@@ -18,7 +18,6 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/egoist/mygo/internal/callcontext"
 	"github.com/egoist/mygo/internal/tsgen"
 )
 
@@ -64,6 +63,10 @@ var ipc struct {
 	services []*service
 	methods  map[string]*method
 	events   []*eventInfo
+	// writeClient is WriteTypeScript once the app bound a service or
+	// declared an event, which App.Run calls under MYGO_GENERATE: an app
+	// that binds nothing writes no client, and links no generator.
+	writeClient func(path string) error
 }
 
 var (
@@ -91,6 +94,7 @@ var (
 // The service is named after its type; Bind panics if the name is taken or a
 // method uses a type that cannot be encoded as JSON (channels, functions).
 func Bind(services ...any) {
+	linkClient()
 	for _, s := range services {
 		if err := bind("", s, false); err != nil {
 			panic(err)
@@ -101,9 +105,20 @@ func Bind(services ...any) {
 // BindAs is Bind with an explicit service name, for services whose type
 // names collide.
 func BindAs(name string, service any) {
+	linkClient()
 	if err := bind(name, service, false); err != nil {
 		panic(err)
 	}
+}
+
+// linkClient makes App.Run write the TypeScript client under
+// MYGO_GENERATE, for Bind and BindAs: only apps that bind something link
+// the generator (go/parser and all), which plugins' services, bound by
+// MyGo, and apps of native UI have no use for.
+func linkClient() {
+	ipc.Lock()
+	ipc.writeClient = WriteTypeScript
+	ipc.Unlock()
 }
 
 func bind(name string, svc any, internal bool) error {
@@ -127,21 +142,52 @@ func bind(name string, svc any, internal bool) error {
 	}
 	s := &service{name: name, typ: t, internal: internal}
 	for i := range t.NumMethod() {
-		m, err := newMethod(name, t.Method(i), v)
+		m := t.Method(i)
+		mi, err := newMethod(name, m.Name, v.Method(m.Index))
 		if err != nil {
 			return err
 		}
-		s.methods = append(s.methods, m)
+		mi.pc = methodPC(t, m.Name)
+		s.methods = append(s.methods, mi)
 	}
 	if len(s.methods) == 0 {
 		return fmt.Errorf("mygo: %s has no exported methods to bind", t)
 	}
+	return register(s)
+}
 
+// bindFuncs binds a service of MyGo's own whose methods are funcs, by
+// name. Unlike bind, it does not list methods with reflect: a program
+// that does reflect.Type.Method keeps every exported method of its types,
+// as the linker cannot tell which it calls, so only apps that call Bind
+// should pay for it.
+func bindFuncs(name string, funcs ...namedFunc) error {
+	s := &service{name: name, internal: true}
+	for _, f := range funcs {
+		fn := reflect.ValueOf(f.fn)
+		mi, err := newMethod(name, f.name, fn)
+		if err != nil {
+			return err
+		}
+		mi.pc = fn.Pointer()
+		s.methods = append(s.methods, mi)
+	}
+	return register(s)
+}
+
+// namedFunc is a method of a service that bindFuncs binds.
+type namedFunc struct {
+	name string
+	fn   any
+}
+
+// register adds the bound service s.
+func register(s *service) error {
 	ipc.Lock()
 	defer ipc.Unlock()
 	for _, x := range ipc.services {
-		if x.name == name {
-			return fmt.Errorf("mygo: a service named %s is already bound", name)
+		if x.name == s.name {
+			return fmt.Errorf("mygo: a service named %s is already bound", s.name)
 		}
 	}
 	if ipc.methods == nil {
@@ -149,19 +195,20 @@ func bind(name string, svc any, internal bool) error {
 	}
 	ipc.services = append(ipc.services, s)
 	for _, m := range s.methods {
-		ipc.methods[name+"."+m.name] = m
+		ipc.methods[s.name+"."+m.name] = m
 	}
 	return nil
 }
 
-func newMethod(service string, m reflect.Method, recv reflect.Value) (*method, error) {
-	ft := m.Type
-	mi := &method{service: service, name: m.Name, fn: recv.Method(m.Index), variadic: ft.IsVariadic()}
-	where := service + "." + m.Name
-	start := 1 // skip the receiver
-	if ft.NumIn() > 1 && ft.In(1) == contextType {
+// newMethod makes the method name of service, which calls fn, a func.
+func newMethod(service, name string, fn reflect.Value) (*method, error) {
+	ft := fn.Type()
+	mi := &method{service: service, name: name, fn: fn, variadic: ft.IsVariadic()}
+	where := service + "." + name
+	start := 0
+	if ft.NumIn() > 0 && ft.In(0) == contextType {
 		mi.ctx = true
-		start = 2
+		start = 1
 	}
 	for i := start; i < ft.NumIn(); i++ {
 		p := ft.In(i)
@@ -198,7 +245,6 @@ func newMethod(service string, m reflect.Method, recv reflect.Value) (*method, e
 			return nil, fmt.Errorf("mygo: %s: result: %w", where, err)
 		}
 	}
-	mi.pc = methodPC(recv.Type(), m.Name)
 	return mi, nil
 }
 
@@ -240,7 +286,6 @@ func (m *method) call(w *Window, page context.Context, token string, args []rawV
 		// The page closing a channel cancels the call. The channels close
 		// when it returns, before its result is sent.
 		ctx, cancel = context.WithCancel(page)
-		ctx = context.WithValue(ctx, callcontext.PageKey{}, page.Done())
 		defer func() {
 			for _, c := range chans {
 				c.close(closedByGo)
@@ -432,6 +477,7 @@ func NewEvent[T any](name string) *Event[T] {
 		}
 	}
 	ipc.events = append(ipc.events, &eventInfo{name: name, typ: t, pc: pc, file: file, line: line})
+	ipc.writeClient = WriteTypeScript
 	return &Event[T]{name: name}
 }
 
@@ -500,22 +546,19 @@ func encodeEvent(name string, payload any) (message, error) {
 	return message{b, p, closeBrace}, nil
 }
 
-// windowControls backs window.mygo.window in the page.
-type windowControls struct{}
-
-func (windowControls) Minimize(ctx context.Context)         { CallerWindow(ctx).Minimize() }
-func (windowControls) Maximize(ctx context.Context)         { CallerWindow(ctx).Maximize() }
-func (windowControls) Unmaximize(ctx context.Context)       { CallerWindow(ctx).Unmaximize() }
-func (windowControls) ToggleMaximize(ctx context.Context)   { CallerWindow(ctx).ToggleMaximize() }
-func (windowControls) IsMaximized(ctx context.Context) bool { return CallerWindow(ctx).IsMaximized() }
-func (windowControls) ToggleFullScreen(ctx context.Context) { CallerWindow(ctx).ToggleFullScreen() }
-func (windowControls) Close(ctx context.Context)            { CallerWindow(ctx).Close() }
-func (windowControls) SetTitle(ctx context.Context, title string) {
-	CallerWindow(ctx).SetTitle(title)
-}
-
+// The service mygo:window backs window.mygo.window in the page.
 func init() {
-	if err := bind("mygo:window", windowControls{}, true); err != nil {
+	err := bindFuncs("mygo:window",
+		namedFunc{"Minimize", func(ctx context.Context) { CallerWindow(ctx).Minimize() }},
+		namedFunc{"Maximize", func(ctx context.Context) { CallerWindow(ctx).Maximize() }},
+		namedFunc{"Unmaximize", func(ctx context.Context) { CallerWindow(ctx).Unmaximize() }},
+		namedFunc{"ToggleMaximize", func(ctx context.Context) { CallerWindow(ctx).ToggleMaximize() }},
+		namedFunc{"IsMaximized", func(ctx context.Context) bool { return CallerWindow(ctx).IsMaximized() }},
+		namedFunc{"ToggleFullScreen", func(ctx context.Context) { CallerWindow(ctx).ToggleFullScreen() }},
+		namedFunc{"Close", func(ctx context.Context) { CallerWindow(ctx).Close() }},
+		namedFunc{"SetTitle", func(ctx context.Context, title string) { CallerWindow(ctx).SetTitle(title) }},
+	)
+	if err != nil {
 		panic(err)
 	}
 }

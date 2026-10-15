@@ -57,7 +57,8 @@ framework safely. Read it before changing anything under `internal/`.
 ├── protocol.go         custom schemes served by http.Handler, FileServer
 ├── frontend.go         the app's frontend: relative URLs, devUrl, mygo://localhost
 ├── menu.go             Menu/MenuItem model, roles, native item updates
-├── cookies.go          Cookies: the pages' cookies, checked and keyed by name, domain and path
+├── cookies.go          Cookies: the pages' cookies, checked, keyed by name, domain and path, filtered by CookieFilter
+├── recent_docs.go jumplist.go: recent documents (Open Recent and the system's lists), the jump list
 ├── dialog.go modules.go clipboard.go: shell, clipboard, screen, theme, tray, shortcuts, notifications
 ├── watch.go watch_scan.go: WatchFiles, and what a watch saw of its directory
 ├── document*.go        NewDocuments: documents, their saving, recovery copies, watches, menus
@@ -90,6 +91,7 @@ framework safely. Read it before changing anything under `internal/`.
 │   ├── svg/            SVG parsing and drawing, for icons and images
 │   ├── tsgen/          TypeScript client generator
 │   ├── i18ngen/        checks catalogs of messages, writes their Go and TypeScript functions
+│   ├── i18nlink/       what package i18n gives MyGo's own catalog only: a catalog that links no dates
 │   ├── l10n/           MyGo's own strings: the catalog of the controls and menu roles
 │   ├── accelerator/    parses "CmdOrCtrl+Shift+K"
 │   ├── update/         update manifests, signatures, archives and delta updates
@@ -786,6 +788,14 @@ window (`CallerWindow`) and is canceled when the page navigates or the window
 closes. `Bind` validates every parameter and result type up front
 (`tsgen.Validate`), so unsupported types fail at startup, not at call time.
 
+`Bind` lists a service's methods with `reflect.Type.Method`, and a program
+that does that keeps every exported method of every type in an interface,
+since the linker cannot tell which it calls: about 2.5 MB of a native UI
+app. So only apps that call `Bind` (or `Use` a plugin with a service) link
+it. MyGo's own service, `mygo:window` behind `window.mygo.window`, is bound
+by `bindFuncs`, from funcs, without it; `go build -ldflags=-dumpdep`
+prints `<ReflectMethod>` on what does it.
+
 JSON options (`jsonOptions` in `ipc.go`) are shared by calls and events:
 json/v2 defaults (nil slices encode as `[]`, case-sensitive names),
 `time.Duration` as nanoseconds, and U+2028/2029 escaped for JavaScript.
@@ -933,12 +943,14 @@ build` like mygo-runtime and released with the same version.
   Connections belong to their page and close on navigation or app quit.
   `mygo-plugin.json` names the six native-library assets, which the CLI
   bundles like libghostty-vt, with checksums for the library assets. Go and native UI apps can also open connections directly.
-- **watch** gives pages `mygo.WatchFiles` watches of the directories the
-  app names, by their names. `Watch` streams the events through a channel
-  for as long as the watch lasts. A page's watches count against its quota
-  by the `Done` channel of its page context, which ipc.go gives plugins in
-  the call's context (`internal/callcontext`), as navigating starts a new
-  one; they stop with the page context.
+- **watch** gives pages `mygo.WatchFiles` watches of the directories and
+  files the app names, by their names (`Roots`, or `Resolve` for those
+  granted while it runs). `Watch` streams a part per batch through a
+  channel for as long as the watch lasts, and returns how it ended, a code
+  the page turns into a `WatchError`. A page's watches count against its
+  quota by `mygo.CallerPage` while their call's context is not done, as
+  navigating ends the page context before the watches have stopped; they
+  stop with it.
 
 - **terminal** is a terminal for native UI: a `Terminal` runs a program in
   a pseudo-terminal and emulates it with libghostty-vt, Ghostty's terminal
@@ -999,7 +1011,20 @@ build` like mygo-runtime and released with the same version.
     methods, finds its key from US layout. Mouse reports go through the
     mouse encoder while the program asks for them; otherwise a selection
     gesture of libghostty-vt turns presses and drags into selections, with
-    the clicks it counts itself.
+    the clicks it counts itself. Keys meet the terminal's keybinds before
+    the encoder: Ghostty's defaults for the platform with the app's over
+    them, as Ghostty layers its config. A paste reads the clipboard on the
+    main thread as it starts (every format for `OnPaste` or a program in
+    mode 5522, else the text), and the terminal keeps a snapshot: the
+    program's read (OSC 5522) is answered during `Write`, on the reader's
+    goroutine under the terminal's lock, where waiting for the main
+    thread could deadlock. The binding gathers the library's reply and
+    hands it over in one piece, which the input queue writes in pieces
+    that report their progress. Any other read of the clipboard
+    (`ClipboardRead`: OSC 52's "?" and OSC 5522, unless a paste granted
+    it) is queued instead: the binding holds the library's own refusal
+    back, and the view, on the main thread, reads the clipboard and
+    writes the answer, which the reader's lock makes safe.
   - *Shipping the library.* `mygo-plugin.json` names its build for each
     platform, published as release assets with their SHA-256 checksums.
     The CLI puts them into apps
@@ -1082,7 +1107,10 @@ build` like mygo-runtime and released with the same version.
 
 `mygo generate` builds the app and runs it with `MYGO_GENERATE=<file>`;
 `App.Run` then writes the client (`WriteTypeScript`) and returns before
-touching the GUI. The generator combines:
+touching the GUI. It reaches the generator through what `Bind`, `BindAs`
+and `NewEvent` register (`ipc.writeClient`): an app that binds nothing
+writes no client, and links neither the generator nor go/parser (375 KB).
+The generator combines:
 
 - **Reflection** for correctness: types follow json/v2 encoding (embedded
   structs are inlined with v2's conflict rules, `omitempty`/`omitzero` become
@@ -1164,10 +1192,15 @@ Package `i18n` is a leaf (it imports golang.org/x/text/language only):
   patterns and digits of the default numbering system and of latn); each
   locale stores only the slots in which it differs from its nearest
   ancestor of the list (or from a synthetic root of the values most
-  locales have), as indexes into one pool of strings; the big tables are
-  packed with DEFLATE. At run time `cldr.go` inflates them once and puts a
+  locales have), as indexes into a pool of strings. The slots come in
+  two halves, each with its own entries and pool, packed with DEFLATE in
+  a constant of its own: the numbers with the locales and their parents
+  (`fmtPackedNumbers`, 3 KB), which every app links, as MyGo's own strings
+  format numbers, and the dates with the names of languages
+  (`fmtPackedDates`, 77 KB), which only apps that format dates or name
+  languages link. At run time `cldr.go` inflates each once and puts a
   locale's record together on its first use (an atomic pointer per
-  locale); `keyOf` caches what a tag formats with (its data locale, by
+  locale), its dates on the first date it formats (`withDates`); `keyOf` caches what a tag formats with (its data locale, by
   `Parent` and likely scripts, and its `-u-hc`, `-u-fw`, `-u-nu`). Week
   data, time data and day period rules are small tables by region.
   `dtpg.go` ports ICU's DateTimePatternGenerator (dtTypes, distances,
@@ -1183,7 +1216,11 @@ Package `i18n` is a leaf (it imports golang.org/x/text/language only):
   ICU's MessagePattern does (apostrophe mode DOUBLE_OPTIONAL, `#` only in
   a plural's own cases), and formats numbers and dates with the
   formatting above; a plural case is picked on the number as `#` writes
-  it. `mygo-runtime/i18n` is its TypeScript twin over `Intl` (skeletons
+  it. Dates go through `timeFormat`, which `NewCatalog`,
+  `NewLibraryCatalog` and `ParseMessage` set (`linkTimes`): MyGo's own
+  catalog, which every app formats and which has no dates (its test
+  checks), is made through `internal/i18nlink`, which does not, so an app
+  that formats no date links no date formatting. `mygo-runtime/i18n` is its TypeScript twin over `Intl` (skeletons
   turned into `Intl`'s options, as V8 turns them back);
   `i18n/testdata/messages.json` holds the cases both test.
 - **Catalogs** read a language's file once, on its first message
@@ -1215,9 +1252,11 @@ does not import `internal/l10n`.
 registered for apps, and a function and a method of `Messages` per key)
 and the TypeScript module, which carries the messages with each
 language's fallback chain. `internal/l10n` is MyGo's own catalog,
-generated by the same code (`go generate ./internal/l10n`), whose keys
-apps change as `mygo.<key>`; the CLI checks those keys against it. It
-embeds English only: each translation is a package,
+generated by the same code (`go generate ./internal/l10n`, with
+`i18ngen.Options.Own`), whose keys apps change as `mygo.<key>`; the CLI
+checks those keys against it (`l10n.FS`, the files as written, which only
+the CLI links). It embeds English only, as `messages/en.json`, which the
+generator writes from `en.json` without the descriptions (7 KB of 28): each translation is a package,
 `locales/<tag>`, that adds its file to the catalog as it is imported
 (`i18n.Catalog.Add`), so that an app links only the languages it ships.
 The generator writes those packages and `l10n.Languages`; the CLI passes
@@ -1597,11 +1636,32 @@ it sees and what it saw (`fileWatchDiff`). An entry whose identity
 (`os.SameFile`) moved is a rename, unless a hard link makes it ambiguous,
 and what moved with a directory renamed above it says nothing more. When
 the system lost changes (an inotify queue overflow, Windows'
-`ERROR_NOTIFY_ENUM_DIR`), the core lists every directory again rather than
-stopping. Enrolling is checked against the scan: the backend opens a target
+`ERROR_NOTIFY_ENUM_DIR`, FSEvents' `MustScanSubDirs` or a dropped event),
+the core lists every directory again rather than stopping. Enrolling is
+checked against the scan: the backend opens a target
 and compares its identity with what the scan saw, then the scan stats it
 again, so that an entry replaced in between (an editor's atomic save) is
 looked at again rather than watched in place of the other.
+
+A watched file is watched through its directory, enrolled as `..` with
+the file as `.`: the scan's `os.Root` is the directory, and notices of the
+directory naming other entries are dropped. A file replaced at its path is
+reported as written. `Ignore` is asked before an entry is stat'ed, from
+the directory listing's type, so an ignored directory is never opened;
+the directories it ignored are kept per listed directory, so that the
+notices of a `Subtree` target about what is in them are dropped.
+
+An entry the scan can't look at, a directory without permission or a
+file Windows holds (`pagefile.sys`, a sharing violation), is left as it
+was seen, if at all, and what is in it unwatched, rather than ending the
+watch; only the watched directory itself must be readable.
+
+`Next` returns a batch, the events of one update. An update doesn't run
+while a batch waits for `Next` (`taken` tells the goroutine when one was
+taken): notices still mark what to look at, a set that falls back to
+looking at everything past `MaxEntries`, so a slow reader loses nothing
+and holds one batch. A directory gone ends the watch with a `FileRemove`
+of `.` and `io.EOF`, as `Close` and the watch's context do.
 
 The watch's goroutine is the only user of its scan and of its backend's
 watcher, whose methods `internal/watchdriver` runs on a goroutine of its
@@ -1611,14 +1671,34 @@ reports; `notice` hands it to the watch's goroutine over a channel, and a
 full channel makes the watch look at everything again. Neither uses the
 main thread, so watches work before the app runs and don't wait on it.
 
-- macOS: kqueue `EVFILT_VNODE` on a descriptor opened `O_EVTONLY` for every
-  file and directory, since a directory tells that its entries changed but
-  not which, and a file's writes only reach its own descriptor.
-- Linux: an inotify instance per watch with a watch per directory, which
-  names the child that changed. The same directory added twice shares a
-  watch descriptor, and a removed descriptor's events still queued before
-  its `IN_IGNORED` must not be taken for a new one's, so the backend keeps
-  generations of targets per descriptor.
+- macOS: an FSEventStream per directory target, which covers the whole
+  tree beneath it, so nothing is opened per file, and a file target is
+  covered by the stream of its directory. A target below a stream already
+  watching its tree needs no stream of its own, which keeps a watch of a
+  directory that isn't recursive at one stream. The stream names what
+  changed (`kFSEventStreamCreateFlagFileEvents`) and hears of the root
+  itself (`kFSEventStreamCreateFlagWatchRoot`), delivering through one
+  callback created at startup, on one serial dispatch queue of the
+  process, never the main thread. `Subtree` targets report paths at any
+  depth; one without it drops what changes deeper than its entries. The
+  stream's path is resolved with `realpath`, as FSEvents names what is
+  on disk, which a path given on a case-insensitive volume may not. The
+  notices are hints: `MustScanSubDirs` or a full queue makes the core look
+  at everything again, as an overflow does elsewhere, and the stream's
+  10 ms latency is under the core's debounce, which does the coalescing an
+  app sees. The stream starts `SinceNow`, but fseventsd can report a
+  change made just before it started; the core's snapshot is taken as
+  targets are enrolled, so nothing comes of it.
+- Linux: one inotify instance for the process, as fsnotify, with a watch
+  per directory, which names the child that changed: watches cost watch
+  descriptors, not instances, of which many systems allow 128 per user
+  for all apps. A goroutine reads it through the runtime's poller and
+  queues each watch's notices, which its driver's `Wait` returns. The
+  same directory added twice, by one watch or several, shares a watch
+  descriptor, and a removed descriptor's events still queued before its
+  `IN_IGNORED` must not be taken for a new one's, so the backend keeps
+  generations of targets, each its watch and ID, per descriptor; the
+  last target of a descriptor removes it.
 - Windows: `ReadDirectoryChangesW` on overlapped handles, completing on a
   completion port per watch. Windows refuses to rename a directory while a
   handle is open on something beneath it, so a recursive watch is one
@@ -1629,6 +1709,18 @@ main thread, so watches work before the app runs and don't wait on it.
   The handles can't be given to the os package, which would tie them to the
   Go runtime's completion port. A handle closed still completes its I/O,
   which writes to its buffer, so a session lives until its completion.
+  A drive's root has no parent to watch, and can't be renamed. The
+  directories that `Lstat` takes for directories are watched, which leaves
+  out junctions and mount points but not the placeholders of cloud files
+  (OneDrive), reparse points that are no name surrogates.
+
+Backends report a write (`FileWatchWrite`) only for content: FSEvents'
+`ItemModified` on a file (its `ItemCreated`, which APFS also sets on an
+`O_TRUNC` write, stays dirty and lets the core's comparison report the
+change), inotify's `IN_MODIFY` and `IN_CLOSE_WRITE`,
+and Windows without `FILE_NOTIFY_CHANGE_ATTRIBUTES`. Attribute changes are
+dirty, and the core compares only size and modification time, so that
+indexers and antivirus touching metadata report nothing.
 
 ## Documents (`document*.go`)
 
@@ -1637,7 +1729,10 @@ bookkeeping and SwiftUI's 2026 `Document` for the shape (a snapshot on the
 main thread, the I/O on goroutines), with the recovery copies of VS Code
 and Zed. Everything is in the core; backends only show a window's
 document (`Window.SetRepresentedFile`, `SetDocumentEdited`) and replace
-files (`Backend.ReplaceFile`).
+files (`Backend.ReplaceFile`). The menus reach documents only through the
+functions the first kind registers (`linkedDocuments`), so that apps
+without documents do not link them through the File menu's roles and Open
+Recent (about 290 KB).
 
 - *State.* `Document[T]` embeds `docBase`, the state that doesn't depend on
   the content's type, under one mutex: a change counter (`changes`), the
@@ -1667,10 +1762,12 @@ files (`Backend.ReplaceFile`).
   takes the sessions whose lock it gets, reopens their documents edited
   (in conflict when the file's stamp changed), writes them into its own
   session, then removes the old ones.
-- *Watches.* One `WatchFiles` per folder of open documents, shared by
-  reference count; an event naming a document's file makes it look at the
-  disk (`checkDisk`), as focusing its window does. A rename within the
-  folder is followed.
+- *Watches.* One `WatchFiles` per file of open documents, shared by
+  reference count, which costs the same whatever else its folder holds: a
+  watch covers the folder, not each file in it. A batch
+  makes the document look at the disk (`checkDisk`), as focusing its
+  window does, and so does the watch once it started. A removal looks in
+  the folder for the file's identity, to follow a rename.
 - *Closing and quitting* never nest an event loop: `OnClose` of a
   document's window prevents a close that must save or ask, does it on a
   goroutine (dialogs are sheets on macOS), then destroys the window. The
@@ -1685,7 +1782,10 @@ files (`Backend.ReplaceFile`).
   roles; `refreshDocumentMenus` enables them for the focused window's
   document when focus or a document's state changes, and
   `updateRecentMenus` rebuilds the Open Recent submenus from
-  `recent-documents.json`.
+  `recent-documents.json` (`recent_docs.go`), which `App.AddRecentDocument`
+  and `ClearRecentDocuments` write, for documents and other apps alike,
+  before telling the system; in an app without documents an item goes to
+  `OnOpenFile`.
 
 ## Native UI (`ui`)
 
@@ -1700,15 +1800,24 @@ identity without depending on construction order; focus requests wait for a
 hidden control. `Services` offers persistent clipboard, URL and redraw access.
 
 Constructors build and style controls eagerly. `Context.Key` supplies an ID
-before state initialization. `Changed` and `Submitted` apply pending input
-to controls built so far, once per pass, before returning the response. This
-lets polling commit a local bound value immediately. Input options must be
-configured before response queries. Public click and shortcut queries also
-apply pending bound input before returning, so inline actions see the latest
-edits. `ComboboxParts.Chosen` applies input and reports a choice in the same
-pass; it is not carried into a later rebuild. Private widget queries do not
-finalize input during construction, before fluent configuration. Remaining
-input applies after construction. `OnChange` and `OnSubmit` run after construction and bound
+before state initialization. A control takes its input as the public
+constructor that built it returns, as Dear ImGui's widgets do, so what it
+binds, a local copy too, holds the edit when the next statement reads it
+(`value_input.go`). The generated facade brackets each constructor with
+`beginBuild` and `endBuild`; a control's queued input records how many
+constructors were under way, and `endBuild` finalizes the input queued
+deeper than the constructors still under way: a container's (a radio
+group's arrow keys) waits aside until the call that built its children
+returns, and each entry is visited once. Input queued outside public
+constructors, by the engine's own controls, is finished at once, and what
+remains applies after construction. Input follows the options of the build
+the user acted on: a constructor resets its fluent options (`ReadOnly`,
+`OnPaste`, a slider's `Step`) for this build after keeping the last build's,
+which edits apply by (`editor.withShown`, `sliderSettings.shown`), and the
+retained `flagDisabled` is last build's. `Changed`, `Submitted`, click and
+shortcut queries apply finished input before answering.
+`ComboboxParts.Chosen` applies input and reports a choice in the same
+pass; it is not carried into a later rebuild. `OnChange` and `OnSubmit` run after construction and bound
 input, before rebuilding. Notices are cleared before another pass so an
 edit cannot be reported again on a fresh local binding. Callback actions
 consume input once and rebuild before paint.
@@ -2044,9 +2153,20 @@ either.
   it, moving over it or scrolling over it; once it takes a press, the
   moves and the release come to it, as to a pressed element. Its
   `TextCaret` turns on the input method at that caret, with no text around
-  it. `ui.Shape` lays out text without the cache of layouts, for widgets
+  it; `InputMethod(false)` (`TextInputState.NoInputMethod`) keeps text on
+  but input methods off, as winit's `set_ime_allowed(false)`: macOS skips
+  `interpretKeyEvents:` and inserts the event's `characters`, Windows
+  disassociates the IMM context and keeps `WM_CHAR`, and GTK takes the
+  focus from the IM context and sends the keyval's character; browsers
+  cannot. `ui.Shape` lays out text without the cache of layouts, for widgets
   that keep their glyphs, and `Painter.Glyphs` draws them where they
   placed them.
+  A text input's `OnTextKey` gets the keys that type no text as they
+  come too, after `HandleInput`, but first applies the input queued for
+  the editor (`widgetTextInput.prepare`, as the platform's queries do),
+  so that fn reads the text typed before the key; a key it takes is
+  taken as `HandleInput`'s are. Shortcuts around the focus claim keys
+  first unless the editor wants them (`editor.wants`), as Enter.
   `HandleTextInput` connects a custom element's application-owned
   `TextInputClient` to the same platform services. A stable, focus-checked
   adapter supplies absolute UTF-16 text ranges, selection, marked text,
@@ -2101,11 +2221,19 @@ either.
   `Handler.ThemeChanged`, as the appearance's does; package `ui` reads them
   once until the next, the default theme follows them (`Theme.follow`), and
   `Animate` follows reduced motion. Package `mygo` reads them the same way:
-  `Theme.Preferences()` (and `AccentColor`, `ReduceMotion`, `HighContrast`,
-  `TextScale`) keeps them until the next change, and every page hears them
-  through the `mygo:preferences` event and the `--mygo-accent` and
-  `--mygo-text-scale` CSS variables, the accent left unset where the desktop
-  has none.
+  `Theme.Preferences()` keeps them until the next change, with reduced
+  transparency too, which package `ui` does not follow. Pages get them as
+  `ThemePreferences`' JSON (its `MarshalJSON`, the accent a CSS color or
+  `null`), which is mygo-runtime's `ThemePreferences`: `tsgen` imports that
+  type for it rather than declaring one (`runtimeTypes`). A user script
+  after the bridge delivers the `mygo:preferences` event at document start;
+  the bridge keeps the latest for `preferences()` and sets the
+  `--mygo-accent` and `--mygo-text-scale` CSS variables, the accent left
+  unset where the desktop has none. When they change, the core sends the
+  event to every page and replaces that script (`Page.SetUserScripts`:
+  WebKit's content controllers remove all their scripts, WebView2 by the
+  ids it reports), so a document loaded later paints with the new values
+  from the start.
 - **Lists** (`ui/list.go`) build only the rows in view and keep their
   place by a row, the anchor, and how far its top is above where the
   content starts, not by an offset into their content: rows are measured,
@@ -2878,12 +3006,23 @@ either.
   and height of missing bitmaps as well as their area, so long thin
   paths fit on the repaint too. The first glyph can grow an empty atlas
   immediately, without invalidating anything already painted.
-- **Renderers.** `internal/gpu` turns a scene into one instanced quad per
-  operation, in batches that share a scissor rectangle and an image, for one
+- **Renderers.** `internal/gpu` turns a scene into instanced quads, in
+  batches that share a scissor rectangle and an image, for a
   shader that computes the signed distance to rounded rectangles, Evan
   Wallace's blurred rounded box, gradients, stripes, the dashes of borders,
   atlas coverage and the innermost rounded clip; outer clips are scissor
-  rectangles. An effect draws in a batch of its own, with a pipeline of
+  rectangles. The builder omits operations wholly hidden by the certainly
+  opaque core of a later fill, keeping at most eight occluders and treating
+  backdrop-reading effects as barriers. Its planner shares clipping rules
+  with drawing, grows shadow support before transforming it, and skips
+  scenes without potential opaque fills. Large shadows with a caster and
+  border-only fills draw as up to four scissored strips around interiors
+  where their output is zero. These scissors never change a clip mask's
+  sampling coordinates. Both transformations are shared by all GPU backends.
+  Metal opts into three further builder capabilities: marking fills whose
+  clip coverage is one, splitting opaque cores from blended edges, and
+  batching by fragment class. Other renderers keep the original instance
+  flags and class-independent batching. An effect draws in a batch of its own, with a pipeline of
   its own, which the renderer makes the first time the effect draws; one
   reading its backdrop draws after a backdrop step (`Builder.Backdrops`):
   the renderer ends its pass, reads the backdrop's area of what it drew
@@ -2960,13 +3099,30 @@ either.
     them (`presentDrawable:`), sparing a pass of AppKit's display cycle
     and a commit of the transaction each: an animation at 120 Hz takes
     about half the main thread's time it would. A frame presented so
-    that waited for its drawable, as the display held both until its next
-    refresh, has the next skip a refresh (`Behind`, at most once a
-    second), or the frames after would wait as long, most of each
-    refresh, blocking the main thread. Each frame waits for the GPU to
-    finish the last before it updates the textures and the instance
-    buffer the last read, so two drawables do rather than the three a
-    layer makes while a window animates. Two seconds after the last frame, as the
+    that waited for its drawable, as the display held the others until
+    its next refresh, has the next skip a refresh (`Behind`, at most
+    once a second), or the frames after would wait as long, most of each
+    refresh, blocking the main thread. Instances use two frame slots, for
+    the main target and each canvas, and a slot waits only for the command
+    buffer that last used it. Updating an atlas or image texture in place
+    still waits for every frame in flight. Rendering a canvas into its
+    texture stays ordered on the command queue. The layer keeps three
+    drawables, as Core Animation makes while a window animates: with two,
+    on a ProMotion display, frames waited for one most of each refresh, a
+    skip catching up for a few frames only, and a fifth of the frames went
+    undrawn. The third costs a frame of memory while a window animates.
+    Waiting for a drawable remains separate from waiting for an instance
+    buffer, so offscreen encode timings do not establish presentation latency.
+    Opaque fill cores use an unblended pipeline in BGRA8; float16 keeps
+    blending to preserve its interpolation rounding. Fragment functions are
+    specialized by batch class and continuous corners, with general shaders
+    as an identical fallback. A worker compiles and warms these pipelines,
+    cached per device, outside the frame path. Renderer release stops and
+    joins that worker before releasing its shader library. Float16 shadows
+    stay general, and fills with fractional opacity avoid the plain class,
+    because specialization otherwise changes rounding. Function constant
+    indices 0 through 7 belong to the renderer; effects start their own at 8.
+    Two seconds after the last frame, as the
     driver frees its own memory of frames, a timer shrinks the drawables,
     which frees all but the one shown, until the next frame makes them
     again, and releases GPU instance buffers, atlas/image textures and
@@ -3488,8 +3644,71 @@ than the 7763), so timings are compared only among commits measured on
 the same CPU, and their charts draw the last commit's CPU as the line and
 others in gray.
 
+The Metal `BenchmarkRenderFillRate` benchmark covers nested opaque layers,
+large border rings and stacked shadows at 3456×2000. It reports command
+buffer GPU timestamps with the existing benchmark harness; it waits for
+individual offscreen frames and does not measure display scheduling or
+input latency. `MYGO_FRAME_STATS` includes instance and batch counts,
+culled operations, opaque cores and Metal specialization fallbacks.
+`MYGO_GPU_REQUIRED=1` makes the Metal optimization identity tests fail if
+no renderer can be created. They compare raw BGRA8 and float16 output with
+both disabled optimizations and the shader from upstream f2eca9f7, including
+canvases and pixelated sprites.
+
 Benchmarks are described on the page by their doc comments, which the
 site reads when it is built: start them with the benchmark's name.
+
+### Binary size
+
+Go's linker keeps what `main` can reach: a function called from anywhere
+reachable, every method of `platform.Backend` and of the other interfaces
+a backend is used through, and the data those touch (a table read on
+first use is linked whole). So a feature costs every app as soon as
+something every app runs calls it, even on a path that never runs. The
+rules, which took counter-native back to 8.9 MB after it had grown from
+10.8 MB to 12.2 MB:
+
+- *Opt-in features hang off their constructor.* What every app reaches
+  (`App.Run`, `NewWindow`, the default menus and their roles, `init`
+  functions, locale resolution) calls an opt-in feature only through
+  functions the feature registers when the app first uses it: the File
+  menu's document roles and Open Recent call `linkedDocuments`, which the
+  first `NewDocuments` fills; `App.Run` writes the TypeScript client
+  through what `Bind` and `NewEvent` register; messages format dates
+  through what `i18n.NewCatalog` registers. Generic constructors are only
+  linked when instantiated, so they are a good place to register.
+- *No reflective method lookups on shared paths.* A reachable call of
+  `reflect.Type.Method`, `reflect.Value.Method` or `MethodByName` with a
+  name the compiler cannot see makes the linker keep every exported method
+  of every type used through an interface: 2.5 MB of counter-native. Only
+  `Bind`, `BindAs` and plugins with a service do it; MyGo's own services
+  use `bindFuncs`. `text/template` and `html/template` do it too.
+- *Backends stay thin.* Every method of `platform.Backend` and its
+  controllers is linked into every app of that platform, used or not, so
+  they translate calls and keep policy, parsing and data in the core or
+  the feature's package.
+- *Heavy packages and data stay where they are needed*: in a subpackage
+  or a plugin (`ui/editor`, `ui/markdown`, `plugins/watch`) rather than in
+  `mygo` or `ui`, and out of `init`. Importing net/http alone adds 2.3 MB.
+  Data read on first use is linked whole, so split a table that a shared
+  path reads in part, as CLDR's numbers and dates are; embed what the
+  running app reads, not what tools read (`internal/l10n` embeds its
+  messages without their descriptions).
+
+To check a change, build both apps as the benchmarks do, before and
+after, on each platform it touches:
+
+```sh
+go build -trimpath -tags mygo_noinspector -ldflags "-s -w -X github.com/egoist/mygo.production=1" -o /tmp/counter-native ./examples/counter-native
+GOOS=windows go build -trimpath -tags mygo_noinspector -ldflags "-s -w -H=windowsgui -X github.com/egoist/mygo.production=1" -o /tmp/hello.exe ./examples/hello
+```
+
+When an app grows, `go tool nm -size -sort size` on a build without `-s
+-w` shows which symbols grew, and `go build -ldflags=-dumpdep ... 2>
+deps.txt` prints every edge `a -> b` of the linker's walk: follow the
+first edge to a symbol back to `main.main` to see why it is there, and
+search for `<ReflectMethod>`, which marks a reflective lookup that keeps
+every method.
 
 ## Releasing
 
@@ -3557,11 +3776,13 @@ which npm allows only for packages that exist: the first release uses an
 5. **Test**: unit test through `internal/fake`, a GUI test in `internal/e2e`
    when behavior depends on the toolkit, and run the Linux GUI tests in the
    container.
-6. **If the page runtime changes**, edit `packages/bridge` or
+6. **Keep apps that don't use it the same size** (see "Binary size"):
+   build `examples/counter-native` and `examples/hello` before and after.
+7. **If the page runtime changes**, edit `packages/bridge` or
    `packages/runtime`, run `bun run test`, `bun run typecheck` and
    `bun run build`, and commit `internal/bridge/bridge.js`. If the generated client changes, update
    `internal/tsgen/generate.go` and its tests.
-7. **Document** the behavior in the Go doc comments and platform
+8. **Document** the behavior in the Go doc comments and platform
    differences in the README.
 
 <!-- repository-only:end -->
@@ -3570,17 +3791,17 @@ which npm allows only for packages that exist: the first release uses an
 
 | feature | macOS | Linux | Windows |
 |---|---|---|---|
-| watching files | kqueue, a descriptor per file and directory | inotify, per directory | `ReadDirectoryChangesW`, one for a recursive tree, and the parent to see the directory renamed |
+| watching files | FSEvents, one stream per tree, no descriptor per file | inotify, per directory | `ReadDirectoryChangesW`, one for a recursive tree, and the parent to see the directory renamed |
 | menu bar | application menu bar, default menu installed | per-window GTK menu bar, none by default | per-window Win32 menu bar, none by default |
 | auto-hide menu bar | ignored | the bar widget hides; `can-activate-accel` keeps its shortcuts; Alt alone or F10 show it and open its first menu until it deactivates | the menu is attached only for the `SC_KEYMENU` menu loop that Alt alone or F10 start; shortcuts come from the webview |
 | tray | NSStatusItem, click events | AppIndicator (menu only, no click events) | notification area icon, click events |
 | global shortcuts | Carbon hot keys | X11: `XGrabKey` on the root window (with Caps/Num Lock variants), key presses from a GDK filter. Wayland: the XDG `GlobalShortcuts` portal (see [Linux](#linux-internallinux)) | `RegisterHotKey` |
 | notifications | UserNotifications, packaged apps only; `Group` is the `threadIdentifier`; the delegate is attached at launch, for the click that launched the app | org.freedesktop.Notifications over D-Bus; no `Group` | notification-area balloons (toasts); no `Group` |
 | notification removal | `removeDeliveredNotificationsWithIdentifiers:`; `ClearNotifications` removes all, earlier runs' too | `CloseNotification` on the bus, for those of this run | hides the balloon, which goes away by itself anyway |
-| WebViewSupported | `WKWebView` is there, which macOS always has | WebKitGTK 4.1 (or 4.0), JavaScriptCore and libsoup load, as `webKit` loads them for a window showing a page | `internal/webview2` finds a runtime, or a `WebView2Loader.dll` next to the executable exports what `createEnvironment` calls; once an environment was made, whether that worked. A runtime whose files are there but whose browser is not passes, and fails later, making the web view |
-| secrets | Security.framework generic passwords in the login keychain (`SecItem*`), service and account as keytar | libsecret's `org.freedesktop.Secret.Generic` schema (attributes `service`, `account`), loaded on first use, libsecret 0.19 or later | Credential Manager generic credentials (`CredWriteW`), target `service/account` |
+| WebViewAvailable (any goroutine, before `Run` too) | `WKWebView` is there, which macOS always has | WebKitGTK 4.1 (or 4.0), JavaScriptCore and libsoup load, as `webKit` loads them for a window showing a page | `internal/webview2` finds a runtime, or a `WebView2Loader.dll` next to the executable exports what `createEnvironment` calls; once an environment was made, whether that worked. A runtime whose files are there but whose browser is not passes, and fails later, making the web view |
+| secrets | Security.framework generic passwords in the login keychain (`SecItem*`), service and account as keytar | libsecret's `org.freedesktop.Secret.Generic` schema (attributes `service`, `account`), loaded on first use, libsecret 0.19 or later; no libsecret, no session bus (`g_bus_get_sync`) or no Secret Service on it (`G_DBUS_ERROR_SERVICE_UNKNOWN`, `NAME_HAS_NO_OWNER`, `NO_SERVER`) is `ErrUnsupported` | Credential Manager generic credentials (`CredWriteW`), target `service/account` |
 | vibrancy | all materials, behind pages and native UI | ignored | Windows 11 22H2 Mica, Acrylic, Tabbed, behind pages and native UI, in windows created with a material, which have no menu bar |
-| accent color and accessibility preferences | `NSColor.controlAccentColor` (10.14+), `accessibilityDisplayShouldReduceMotion` (10.12+) and `accessibilityDisplayShouldIncreaseContrast` (10.10+), with `NSSystemColorsDidChangeNotification` and `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`; no text scale | GTK's `gtk-enable-animations` and theme name, and the settings portal's accent, contrast and GNOME's `text-scaling-factor` (`ReadAll`, `SettingChanged`) | DWM's `AccentColor`, `SPI_GETCLIENTAREAANIMATION`, `SPI_GETHIGHCONTRAST` and Accessibility's `TextScaleFactor`, with `WM_SETTINGCHANGE` |
+| accent color and accessibility preferences | `NSColor.controlAccentColor` (10.14+), `accessibilityDisplayShouldReduceMotion` (10.12+), `accessibilityDisplayShouldReduceTransparency` and `accessibilityDisplayShouldIncreaseContrast` (10.10+), with `NSSystemColorsDidChangeNotification` and `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`; no text scale | GTK's `gtk-enable-animations` and theme name, and the settings portal's accent, contrast and GNOME's `text-scaling-factor` (`ReadAll`, `SettingChanged`); no reduced transparency | DWM's `AccentColor`, `SPI_GETCLIENTAREAANIMATION`, Personalize's `EnableTransparency`, `SPI_GETHIGHCONTRAST` and Accessibility's `TextScaleFactor`, with `WM_SETTINGCHANGE` |
 | preferred languages | the global `AppleLanguages` (`CFPreferencesCopyValue`), not the app's | `LANGUAGE`, then `LC_ALL`, `LC_MESSAGES`, `LANG`; read when asked, no changes reported | `GetUserPreferredUILanguages`, `WM_SETTINGCHANGE` "intl" |
 | regional formats | `autoupdatingCurrentLocale`, its calendar's first weekday, the hour of the skeleton "j"; `NSCurrentLocaleDidChangeNotification` and System Settings' distributed notifications | glibc's `nl_langinfo_l` of `LC_TIME` (`_NL_TIME_FIRST_WEEKDAY`, `T_FMT`), else by region | `GetLocaleInfoEx` of the user's default: `LOCALE_IFIRSTDAYOFWEEK`, `LOCALE_STIMEFORMAT` |
 | the app's language kept | `AppleLanguages` of the app's defaults | the file `locale` in PathUserData | the file `locale` in PathUserData, and the process's preferred UI languages |
@@ -3597,20 +3818,20 @@ which npm allows only for packages that exist: the first release uses an
 | window icon | ignored | `gtk_window_set_icon` | `WM_SETICON` at the window's DPI |
 | URL schemes | Info.plist (`urlSchemes`); `RegisterURLScheme` makes the app the default handler | desktop entry + `mimeapps.list` | `HKCU\Software\Classes` |
 | downloads | `shouldPerformDownload`, non-displayable or attachment responses → `WKDownload` delegate | `download-started` / `decide-destination` on the web context; response policy for attachments | `DownloadStarting` (`ICoreWebView2_4`), replacing WebView2's download UI |
-| Cookies | the default `WKWebsiteDataStore`'s `WKHTTPCookieStore` | the default web context's `WebKitCookieManager` (2.42+, kept in memory); libsoup 3 or 2.4 to match WebKitGTK 4.1 or 4.0 | `ICoreWebView2CookieManager` (`ICoreWebView2_2`) of a window's web view; `put_Expires` called with `comCallFloat` |
+| Cookies | the default `WKWebsiteDataStore`'s `WKHTTPCookieStore`, URLs matched in Go (`platform.CookieMatchesURL`), `Set` through `NSHTTPCookie`'s parser with a stand-in name and value; `Clear` with `removeDataOfTypes:` | the default web context's `WebKitCookieManager` (2.42+; `get_cookies` for a URL), kept in `cookies.sqlite` of the user data directory (`set_persistent_storage`, as WebKitGTK keeps them in memory otherwise); libsoup 3 or 2.4 to match WebKitGTK 4.1 or 4.0; `Clear` with `webkit_website_data_manager_clear` | `ICoreWebView2CookieManager` (`ICoreWebView2_2`) of a window's web view, or before one shows a page of a hidden web view of the app window, closed once one does; a window's first navigation waits for the calls under way; `ClearBrowsingData` goes the same way; changes are polled with `GetCookies` until they show, failing after 2 s; `GetCookies(uri)`, `DeleteAllCookies`; `put_Expires` called with `comCallFloat` |
 | ClearBrowsingData | default `WKWebsiteDataStore`, all types | the web context's website data manager | the WebView2 profile's `ClearBrowsingDataAll` (needs a window) |
 | permissions | `WKUIDelegate` media capture (camera, microphone) | `permission-request` (camera, microphone, geolocation, notifications) | `PermissionRequested` (the same four; WebView2 asks about others) |
 | file associations | `CFBundleDocumentTypes`; files arrive with `application:openURLs:` | desktop entry `MimeType` (`%U`), a shared-mime-info package in the .deb for types the app defines | ProgIDs and `OpenWithProgids` written by the installer |
 | document windows | `representedURL` (proxy icon, Command-click folder menu) and `setDocumentEdited:` (the dot), then the traffic lights are laid out again | the core puts `*` before the title | the core puts `*` before the title |
 | replacing a document's file | `-[NSFileManager replaceItemAtURL:withItemAtURL:…]` (permissions, dates, extended attributes, ACLs, identity) | rename after `chmod` and `lchown` to the target's | `ReplaceFileW`, retried on sharing violations |
 | recent documents | `noteNewRecentDocumentURL:` / `clearRecentDocuments:` of the shared `NSDocumentController` (the Dock menu) | `gtk_recent_manager_add_item`, removing the items of `g_get_application_name()` | `SHAddToRecentDocs` (`SHARD_PATHW`), `IApplicationDestinations::RemoveAllDestinations`; the process keeps the AppUserModelID the shell derives from its path, which the installer's shortcuts have too |
-| jump list tasks | ignored | ignored | `ICustomDestinationList`: the Recent category, `AddUserTasks` with an `IShellLinkW` per task (`PKEY_Title`), `CommitList` |
+| jump list | ignored | ignored | `ICustomDestinationList`, committed whole from what `App.JumpList` keeps: the Recent category, `AddUserTasks` with an `IShellLinkW` per task (`PKEY_Title`, description, working directory, arguments quoted with `syscall.EscapeArg`), `CommitList` |
 | Dock menu | `applicationDockMenu:` | ignored | ignored |
 | PrintToPDF | `printOperationWithPrintInfo:` save job (`NSJobSavingURL`), fit to width | `WebKitPrintOperation` to GTK's "Print to File" | DevTools `Page.printToPDF` |
 | power events | NSWorkspace sleep/wake, `com.apple.screenIsLocked` distributed notifications | logind `PrepareForSleep` (system bus), screen saver `ActiveChanged` (GNOME, freedesktop) | `WM_POWERBROADCAST`, `WM_WTSSESSION_CHANGE` |
 | KeepAwake | `NSProcessInfo` activity (shows in `pmset -g assertions`) | XDG portal `Inhibit`, else `org.freedesktop.ScreenSaver.Inhibit` | `PowerCreateRequest` |
 | IsOnBattery, IdleTime | IOKit power sources, `CGEventSourceSecondsSinceLastEventType` | `/sys/class/power_supply`; Mutter idle monitor or `GetSessionIdleTime` | `GetSystemPowerStatus`, `GetLastInputInfo` |
-| network status | `nw_path_monitor` on a queue of its own, the first `Status` waiting for its first path | `GNetworkMonitor`, `network-available` and `network-metered` | `GetNetworkConnectivityHint`, `NotifyNetworkConnectivityHintChange` |
+| network status | `nw_path_monitor` on a queue of its own, the first `Status` waiting (up to a second) for its first path; online when the path is satisfied, metered when it is expensive or constrained | `GNetworkMonitor`, `network-available` (a default route) and `network-metered` | `GetNetworkConnectivityHint`, `NotifyNetworkConnectivityHintChange`; online from local access up (not none or hidden), metered for a fixed or variable cost, roaming, over or near the data limit |
 | window position | honored | ignored by Wayland compositors | honored |
 | resize borders without a title bar | the window's own | the outer 5 px of the page | invisible, outside the window; along the top of a hidden title bar, a child window |
 | content protection, click-through | yes | ignored | yes |
