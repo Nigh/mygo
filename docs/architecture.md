@@ -2815,6 +2815,12 @@ either.
   cached by their shape relative to the pixel grid in quarters of a pixel,
   to which their points move first: a path looks the same whichever path
   of its key drew its mask first.
+  Opaque `Painter.StrokePolyline` on a GPU is the exception: it emits
+  instanced round-capped segments through the existing fill operations,
+  without path masks. Translucent strokes and CPU rendering use the path
+  outline so overlapping segments do not accumulate opacity. `ui/chart`
+  offers physical-pixel Min/Max buckets and reusable linear paths for
+  streaming data; full samples remain the source of selections and readings.
   So are icons: `internal/svg` parses SVG documents (with `encoding/xml`
   and its own small CSS cascade) into nodes of paths, paints and layers,
   and draws them on the CPU with `internal/vec`, compositing gradients,

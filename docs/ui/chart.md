@@ -138,6 +138,40 @@ area.Draw(func(p *ui.Painter, r ui.Rect) {
 })
 ```
 
+For live linear waveforms, reduce samples to physical pixel columns with
+`chart.MinMax`. It preserves each column's minimum and maximum in their
+original order, plus each run's endpoints, so narrow spikes survive. Inputs are plot
+fractions with nondecreasing X; non-finite values break the line. Keep the
+full samples for selection and readings. Reuse the output slices and a path
+per series to avoid allocations after warming up:
+
+```go
+// Keep reducedX, reducedY and path in the view's persistent state.
+area.Draw(func(p *ui.Painter, r ui.Rect) {
+    reducedX, reducedY = chart.MinMax(reducedX, reducedY, xs, ys,
+        int(math.Ceil(float64(r.W*p.Scale()))))
+    p.StrokePath(chart.LineInto(&path, r, reducedX, reducedY, chart.CurveLinear),
+        2, t.Accent)
+})
+```
+
+`chart.LineInto` replaces the path, retaining its storage and clearing any
+`Trim`. `ui.Path.Reset` also clears a path without discarding its storage.
+Use a fixed-capacity ring for incoming samples and consume them in batches
+on the UI thread. Request continuous frames with `Context.AnimationFrame`,
+independently of the sampling cadence, rather than invalidating per sample.
+See `examples/chart-streaming` for a three-series, 1 kHz rolling waveform.
+
+For opaque live lines, convert the reduced fractions to DIP points and call
+`Painter.StrokePolyline(points, width, color)`. On a GPU it draws instanced
+round-capped segments directly, avoiding CPU path masks; it reuses the
+existing renderer on Metal, Direct3D and GL/WebGL. Reuse the points slice as
+well. CPU rendering and translucent strokes retain the path outline to
+avoid opacity accumulating at joins. Opaque GPU edges can have slightly
+different antialiasing where segments overlap. Existing `StrokePath` keeps
+its rendering behavior. Measurements and commands are in
+[the streaming example](../../examples/chart-streaming/README.md).
+
 ## Stacks
 
 `chart.Stack(series, how)` piles series up, as stacked bars and areas show

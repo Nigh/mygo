@@ -1,10 +1,48 @@
 package ui
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestFrameCapture(t *testing.T) {
+	old := frameCapturePath
+	defer func() { frameCapturePath = old }()
+	frameCapturePath = filepath.Join(t.TempDir(), "frames.json")
+	tt := coreNewTester(func(c *context) { coreText(c, "Capture") }, 100, 100)
+	tt.Frame()
+	tt.rt.stats.flush()
+	b, err := os.ReadFile(frameCapturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var capture struct {
+		Frames  []frameSample
+		Dropped int
+	}
+	if err = json.Unmarshal(b, &capture); err != nil {
+		t.Fatal(err)
+	}
+	if len(capture.Frames) < 2 || capture.Dropped != 0 {
+		t.Fatal("missing frames", capture)
+	}
+	for _, f := range capture.Frames {
+		if f.WallNS <= 0 || f.PhasesNS[phasePaint] <= 0 || f.Path != "drawn in memory" {
+			t.Fatal("invalid frame", f)
+		}
+	}
+	// The bounded collector does not grow or overwrite earlier samples.
+	f := tt.rt.stats
+	f.rows = f.rows[:cap(f.rows)]
+	tt.Frame()
+	if f.dropped != 1 {
+		t.Fatal("unbounded capture")
+	}
+}
 
 func TestFrameStatsSetting(t *testing.T) {
 	for _, tc := range []struct {

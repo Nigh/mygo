@@ -420,6 +420,7 @@ func (h *windowHost) capture() (int, int, []byte) {
 }
 
 func (h *windowHost) detach() {
+	h.rt.stats.flush()
 	h.detached = true
 	if h.idleTimer != nil {
 		h.idleTimer.Stop()
